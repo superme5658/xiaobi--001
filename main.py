@@ -952,11 +952,11 @@ def analyze_short_symbol(inst_id: str, change_24h: float, narratives: Dict[str, 
 
 
 # ============================================================
-# DeepSeek 分析模块
+# DeepSeek 分析模块（加入暴涨可能性评估）
 # ============================================================
 def deepseek_analyze_signal(signal: Dict) -> str:
     """
-    调用 DeepSeek API 分析单个信号，返回分析评语。
+    调用 DeepSeek API 分析单个信号，返回分析评语（含暴涨可能性）。
     若失败或未启用，返回空字符串。
     """
     if not Config.ENABLE_DEEPSEEK or not Config.DEEPSEEK_API_KEY:
@@ -965,7 +965,7 @@ def deepseek_analyze_signal(signal: Dict) -> str:
     d = signal["details"]
     direction = signal["direction"]
 
-    prompt = f"""你是一个加密货币量化交易分析师。请对以下交易信号进行简短分析（50字以内），指出是否值得关注以及简单理由。
+    prompt = f"""你是一个加密货币量化交易分析师。请对以下交易信号进行简短分析，并给出**暴涨可能性（高/中/低）**。
 
 币种: {signal['inst_id']}
 方向: {direction}
@@ -979,7 +979,7 @@ RSI(14): {d['rsi']}
 最终得分: {signal['final_score']}/9
 信号理由: {signal['quality_reason']}
 
-请给出简洁的分析意见（用中文，一句话即可，不要超过50字）。"""
+请用一句话输出（不超过60字），格式为：“分析内容。暴涨可能性：高/中/低”。"""
 
     headers = {
         "Authorization": f"Bearer {Config.DEEPSEEK_API_KEY}",
@@ -989,7 +989,7 @@ RSI(14): {d['rsi']}
         "model": Config.DEEPSEEK_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7,
-        "max_tokens": 100
+        "max_tokens": 120
     }
 
     try:
@@ -1366,10 +1366,8 @@ def scan() -> None:
         logger.info(f"扫描完成，耗时 {elapsed:.1f} 秒 | 做多:{long_count}个 做空:{short_count}个")
         
         if triggers:
-            # 调用 DeepSeek 分析（若启用）
             if Config.ENABLE_DEEPSEEK:
                 logger.info("正在调用 DeepSeek 分析信号...")
-                # 可并发分析提升速度
                 with ThreadPoolExecutor(max_workers=5) as deepseek_executor:
                     deepseek_futures = {deepseek_executor.submit(deepseek_analyze_signal, s): s for s in triggers}
                     for future in as_completed(deepseek_futures):
@@ -1402,7 +1400,7 @@ def health_check():
                     if Config.NARRATIVE_ENABLED:
                         msg += f"\n🎭 叙事热度已启用 (CoinGecko Trending) | 权重系数: {Config.NARRATIVE_WEIGHT}x"
                     if Config.ENABLE_DEEPSEEK:
-                        msg += f"\n🤖 DeepSeek 分析已启用"
+                        msg += f"\n🤖 DeepSeek 分析已启用 (含暴涨可能性评估)"
                     
                     payload = {"msg_type": "text", "content": {"text": msg}}
                     requests.post(Config.FEISHU_WEBHOOK, json=payload, timeout=5)
@@ -1419,7 +1417,7 @@ def main():
         os.makedirs(db_dir, exist_ok=True)
     
     logger.info("=" * 50)
-    logger.info("OKX 多空信号扫描器启动 v3.1 (集成叙事热度 + DeepSeek)")
+    logger.info("OKX 多空信号扫描器启动 v3.2 (叙事热度 + DeepSeek 暴涨可能性)")
     logger.info(f"做多: 最终得分≥{Config.LONG_SCORE_THRESHOLD} | 放量≥{Config.LONG_MIN_VOLUME_RATIO}x | 涨幅≥{Config.LONG_MIN_CHANGE_15M}%")
     logger.info(f"做空: 最终得分≥{Config.SHORT_SCORE_THRESHOLD} | 放量≥{Config.SHORT_MIN_VOLUME_RATIO}x | 跌幅≤{Config.SHORT_MIN_CHANGE_15M}%")
     if Config.NARRATIVE_ENABLED:
@@ -1427,7 +1425,7 @@ def main():
     else:
         logger.info("叙事热度: 已禁用")
     if Config.ENABLE_DEEPSEEK:
-        logger.info(f"DeepSeek 分析: 已启用 | 模型: {Config.DEEPSEEK_MODEL}")
+        logger.info(f"DeepSeek 分析: 已启用 | 模型: {Config.DEEPSEEK_MODEL} (含暴涨可能性评估)")
     else:
         logger.info("DeepSeek 分析: 已禁用")
     
