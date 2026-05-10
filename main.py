@@ -963,13 +963,32 @@ def parse_deepseek_analysis(analysis_text: str) -> Tuple[str, str]:
     if not analysis_text:
         return "", None
     
-    match = re.search(r'暴涨可能性[：:]\s*([高中低])', analysis_text)
-    if match:
-        possibility = match.group(1)
+    # 多种匹配模式
+    patterns = [
+        r'暴涨可能性[：:]\s*([高中低])',
+        r'可能性[：:]\s*([高中低])',
+        r'[，,]\s*([高中低])[暴]?[涨]?',
+    ]
+    
+    possibility = None
+    for pattern in patterns:
+        match = re.search(pattern, analysis_text)
+        if match:
+            possibility = match.group(1)
+            break
+    
+    if possibility and possibility in ['高', '中', '低']:
         # 移除可能性部分，只保留分析内容
         clean_text = re.sub(r'[。，,]\s*暴涨可能性[：:]\s*[高中低]', '', analysis_text)
+        clean_text = re.sub(r'暴涨可能性[：:]\s*[高中低]', '', clean_text)
+        clean_text = re.sub(r'可能性[：:]\s*[高中低]', '', clean_text)
         clean_text = clean_text.strip()
+        # 去除末尾多余的标点
+        clean_text = re.sub(r'[。，,]+$', '', clean_text)
+        if not clean_text:
+            clean_text = analysis_text[:50]
         return clean_text, possibility
+    
     return analysis_text, None
 
 
@@ -983,22 +1002,30 @@ def deepseek_analyze_signal(signal: Dict) -> Tuple[str, str]:
 
     d = signal["details"]
     direction = signal["direction"]
+    
+    # 根据方向微调提示
+    change_desc = "涨幅" if d['change_15m'] > 0 else "跌幅"
 
-    prompt = f"""你是一个加密货币量化交易分析师。请对以下交易信号进行简短分析，并给出**暴涨可能性（高/中/低）**。
+    prompt = f"""分析以下{direction}信号：
 
 币种: {signal['inst_id']}
-方向: {direction}
-当前价格: {d['price']}
-15分钟涨跌幅: {d['change_15m']:.2f}%
-24小时涨跌幅: {signal['change_24h']}%
-成交量比(15m): {d['vol_ratio']}x
-RSI(14): {d['rsi']}
-技术得分: {signal['base_score']}/9
-叙事乘数: {signal['narrative_multiplier']:.2f}x
-最终得分: {signal['final_score']}/9
-信号理由: {signal['quality_reason']}
+价格: {d['price']}
+15分钟{change_desc}: {d['change_15m']:.2f}%
+成交量比: {d['vol_ratio']}x
+RSI: {d['rsi']}
+技术分: {signal['base_score']}/9
+最终分: {signal['final_score']}/9
+理由: {signal['quality_reason']}
 
-请用一句话输出（不超过60字），格式为：“分析内容。暴涨可能性：高/中/低”。"""
+【必须严格按以下格式输出，不要遗漏任何部分】
+一句话分析（20字内）。暴涨可能性：高/中/低
+
+示例输出：
+"放量+技术分高，短期强势。暴涨可能性：高"
+"量能一般且RSI偏高，空间有限。暴涨可能性：中"
+"缩量上涨，动能不足。暴涨可能性：低"
+
+请现在输出："""
 
     headers = {
         "Authorization": f"Bearer {Config.DEEPSEEK_API_KEY}",
@@ -1007,8 +1034,8 @@ RSI(14): {d['rsi']}
     payload = {
         "model": Config.DEEPSEEK_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7,
-        "max_tokens": 120
+        "temperature": 0.2,  # 低温度确保格式稳定
+        "max_tokens": 100
     }
 
     try:
@@ -1022,11 +1049,37 @@ RSI(14): {d['rsi']}
         data = resp.json()
         analysis = data["choices"][0]["message"]["content"].strip()
         
+        logger.info(f"DeepSeek 返回: {analysis}")
+        
         clean_text, possibility = parse_deepseek_analysis(analysis)
+        
+        # 降级逻辑：如果解析失败，使用得分判断
+        if not possibility:
+            logger.warning(f"解析失败，使用得分降级判断: {analysis}")
+            if signal['final_score'] >= 7:
+                possibility = "高"
+                if not clean_text:
+                    clean_text = f"{change_desc}{abs(d['change_15m']):.1f}%且放量{d['vol_ratio']}x"
+            elif signal['final_score'] >= 5:
+                possibility = "中"
+                if not clean_text:
+                    clean_text = f"技术信号一般，需观察"
+            else:
+                possibility = "低"
+                if not clean_text:
+                    clean_text = f"信号强度不足"
+            logger.info(f"降级判断: 可能性={possibility}")
+        
         return clean_text, possibility
     except Exception as e:
         logger.warning(f"DeepSeek 分析失败: {e}")
-        return "", None
+        # API 失败时的降级
+        if signal['final_score'] >= 7:
+            return "技术信号强劲", "高"
+        elif signal['final_score'] >= 5:
+            return "技术信号一般", "中"
+        else:
+            return "技术信号偏弱", "低"
 
 
 # ============================================================
@@ -1403,9 +1456,9 @@ def scan() -> None:
                         
                         # 保留信号，附加分析内容
                         if analysis:
-                            signal["deepseek_analysis"] = f"\n🤖 **DeepSeek分析:** {analysis}"
-                        if possibility:
-                            signal["deepseek_possibility"] = possibility
+                            signal["deepseek_analysis"] = f"\n🤖 **DeepSeek分析:** {analysis}。暴涨可能性：{possibility}"
+                        else:
+                            signal["deepseek_analysis"] = f"\n🤖 **DeepSeek分析:** 技术信号{'偏强' if possibility == '高' else '一般'}。暴涨可能性：{possibility}"
                         filtered_triggers.append(signal)
                 
                 triggers = filtered_triggers
