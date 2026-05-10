@@ -11,6 +11,7 @@ from typing import Optional, Dict, List, Tuple
 import schedule
 import sqlite3
 from contextlib import contextmanager
+import re
 
 # ============================================================
 # 配置类
@@ -952,15 +953,33 @@ def analyze_short_symbol(inst_id: str, change_24h: float, narratives: Dict[str, 
 
 
 # ============================================================
-# DeepSeek 分析模块（加入暴涨可能性评估）
+# DeepSeek 分析模块（含暴涨可能性评估 + 过滤低可能性）
 # ============================================================
-def deepseek_analyze_signal(signal: Dict) -> str:
+def parse_deepseek_analysis(analysis_text: str) -> Tuple[str, str]:
     """
-    调用 DeepSeek API 分析单个信号，返回分析评语（含暴涨可能性）。
-    若失败或未启用，返回空字符串。
+    解析 DeepSeek 返回的分析文本
+    返回: (分析内容, 暴涨可能性)  可能性为 '高'/'中'/'低' 或 None
+    """
+    if not analysis_text:
+        return "", None
+    
+    match = re.search(r'暴涨可能性[：:]\s*([高中低])', analysis_text)
+    if match:
+        possibility = match.group(1)
+        # 移除可能性部分，只保留分析内容
+        clean_text = re.sub(r'[。，,]\s*暴涨可能性[：:]\s*[高中低]', '', analysis_text)
+        clean_text = clean_text.strip()
+        return clean_text, possibility
+    return analysis_text, None
+
+
+def deepseek_analyze_signal(signal: Dict) -> Tuple[str, str]:
+    """
+    调用 DeepSeek API 分析单个信号
+    返回: (分析文本, 暴涨可能性)  可能性为 '高'/'中'/'低' 或 None
     """
     if not Config.ENABLE_DEEPSEEK or not Config.DEEPSEEK_API_KEY:
-        return ""
+        return "", None
 
     d = signal["details"]
     direction = signal["direction"]
@@ -1002,10 +1021,12 @@ RSI(14): {d['rsi']}
         resp.raise_for_status()
         data = resp.json()
         analysis = data["choices"][0]["message"]["content"].strip()
-        return f"\n🤖 **DeepSeek分析:** {analysis}"
+        
+        clean_text, possibility = parse_deepseek_analysis(analysis)
+        return clean_text, possibility
     except Exception as e:
         logger.warning(f"DeepSeek 分析失败: {e}")
-        return ""
+        return "", None
 
 
 # ============================================================
@@ -1258,7 +1279,7 @@ def send_market_report():
 
 
 # ============================================================
-# 扫描主函数（集成叙事 + DeepSeek）
+# 扫描主函数（集成叙事 + DeepSeek + 过滤低可能性）
 # ============================================================
 def scan() -> None:
     logger.info("=" * 50)
@@ -1368,11 +1389,31 @@ def scan() -> None:
         if triggers:
             if Config.ENABLE_DEEPSEEK:
                 logger.info("正在调用 DeepSeek 分析信号...")
+                filtered_triggers = []
                 with ThreadPoolExecutor(max_workers=5) as deepseek_executor:
                     deepseek_futures = {deepseek_executor.submit(deepseek_analyze_signal, s): s for s in triggers}
                     for future in as_completed(deepseek_futures):
                         signal = deepseek_futures[future]
-                        signal["deepseek_analysis"] = future.result()
+                        analysis, possibility = future.result()
+                        
+                        # 如果可能性为"低"，则跳过此信号
+                        if possibility == "低":
+                            logger.info(f"⏭️ 跳过 {signal['inst_id']} ({signal['direction']}) - DeepSeek 判定暴涨可能性低")
+                            continue
+                        
+                        # 保留信号，附加分析内容
+                        if analysis:
+                            signal["deepseek_analysis"] = f"\n🤖 **DeepSeek分析:** {analysis}"
+                        if possibility:
+                            signal["deepseek_possibility"] = possibility
+                        filtered_triggers.append(signal)
+                
+                triggers = filtered_triggers
+                
+                if not triggers:
+                    logger.info("所有信号均被 DeepSeek 过滤（暴涨可能性低），无推送")
+                    return
+            
             send_feishu(triggers)
         
     except Exception as e:
@@ -1400,7 +1441,7 @@ def health_check():
                     if Config.NARRATIVE_ENABLED:
                         msg += f"\n🎭 叙事热度已启用 (CoinGecko Trending) | 权重系数: {Config.NARRATIVE_WEIGHT}x"
                     if Config.ENABLE_DEEPSEEK:
-                        msg += f"\n🤖 DeepSeek 分析已启用 (含暴涨可能性评估)"
+                        msg += f"\n🤖 DeepSeek 分析已启用 (自动过滤暴涨可能性低的信号)"
                     
                     payload = {"msg_type": "text", "content": {"text": msg}}
                     requests.post(Config.FEISHU_WEBHOOK, json=payload, timeout=5)
@@ -1417,7 +1458,7 @@ def main():
         os.makedirs(db_dir, exist_ok=True)
     
     logger.info("=" * 50)
-    logger.info("OKX 多空信号扫描器启动 v3.2 (叙事热度 + DeepSeek 暴涨可能性)")
+    logger.info("OKX 多空信号扫描器启动 v3.3 (叙事热度 + DeepSeek 过滤低暴涨可能性)")
     logger.info(f"做多: 最终得分≥{Config.LONG_SCORE_THRESHOLD} | 放量≥{Config.LONG_MIN_VOLUME_RATIO}x | 涨幅≥{Config.LONG_MIN_CHANGE_15M}%")
     logger.info(f"做空: 最终得分≥{Config.SHORT_SCORE_THRESHOLD} | 放量≥{Config.SHORT_MIN_VOLUME_RATIO}x | 跌幅≤{Config.SHORT_MIN_CHANGE_15M}%")
     if Config.NARRATIVE_ENABLED:
@@ -1425,7 +1466,7 @@ def main():
     else:
         logger.info("叙事热度: 已禁用")
     if Config.ENABLE_DEEPSEEK:
-        logger.info(f"DeepSeek 分析: 已启用 | 模型: {Config.DEEPSEEK_MODEL} (含暴涨可能性评估)")
+        logger.info(f"DeepSeek 分析: 已启用 | 模型: {Config.DEEPSEEK_MODEL} (自动过滤暴涨可能性低的信号)")
     else:
         logger.info("DeepSeek 分析: 已禁用")
     
