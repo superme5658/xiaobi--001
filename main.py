@@ -25,18 +25,21 @@ class Config:
     CONCURRENT_WORKERS = 10
     
     # 扫描配置
-    SCAN_INTERVAL = 15
+    SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))  # 改为30分钟
     KLINE_LIMIT = 100
+    
+    # K线周期配置（支持 15m, 30m, 1H）
+    KLINE_BAR = os.getenv("KLINE_BAR", "30m")
     
     # 通用筛选参数
     MIN_VOLUME_USD = int(os.getenv("MIN_VOLUME_USD", "2000000"))
-    VOL_MULTIPLIER = float(os.getenv("VOL_MULTIPLIER", "1.5"))
+    VOL_MULTIPLIER = float(os.getenv("VOL_MULTIPLIER", "2.0"))  # 从1.5提高到2.0
     MAX_VOLUME_RATIO = float(os.getenv("MAX_VOLUME_RATIO", "20"))
     
     # ========== 做多信号配置 ==========
-    LONG_SCORE_THRESHOLD = int(os.getenv("LONG_SCORE_THRESHOLD", "5"))
-    LONG_MIN_VOLUME_RATIO = float(os.getenv("LONG_MIN_VOLUME_RATIO", "1.2"))
-    LONG_MIN_CHANGE_15M = float(os.getenv("LONG_MIN_CHANGE_15M", "0.5"))
+    LONG_SCORE_THRESHOLD = int(os.getenv("LONG_SCORE_THRESHOLD", "6"))  # 从5提高到6
+    LONG_MIN_VOLUME_RATIO = float(os.getenv("LONG_MIN_VOLUME_RATIO", "1.5"))  # 从1.2提高到1.5
+    LONG_MIN_CHANGE_15M = float(os.getenv("LONG_MIN_CHANGE_15M", "1.0"))  # 从0.5%提高到1.0%
     LONG_MAX_CHANGE_15M = float(os.getenv("LONG_MAX_CHANGE_15M", "12.0"))
     LONG_MIN_RSI = float(os.getenv("LONG_MIN_RSI", "35"))
     LONG_MAX_RSI = float(os.getenv("LONG_MAX_RSI", "75"))
@@ -49,10 +52,10 @@ class Config:
     
     # ========== 做空信号配置 ==========
     ENABLE_SHORT = os.getenv("ENABLE_SHORT", "True").lower() == "true"
-    SHORT_SCORE_THRESHOLD = int(os.getenv("SHORT_SCORE_THRESHOLD", "5"))
-    SHORT_MIN_VOLUME_RATIO = float(os.getenv("SHORT_MIN_VOLUME_RATIO", "1.2"))
-    SHORT_MIN_CHANGE_15M = float(os.getenv("SHORT_MIN_CHANGE_15M", "-2.0"))
-    SHORT_MAX_CHANGE_15M = float(os.getenv("SHORT_MAX_CHANGE_15M", "-0.5"))
+    SHORT_SCORE_THRESHOLD = int(os.getenv("SHORT_SCORE_THRESHOLD", "6"))
+    SHORT_MIN_VOLUME_RATIO = float(os.getenv("SHORT_MIN_VOLUME_RATIO", "1.5"))
+    SHORT_MIN_CHANGE_15M = float(os.getenv("SHORT_MIN_CHANGE_15M", "-2.5"))
+    SHORT_MAX_CHANGE_15M = float(os.getenv("SHORT_MAX_CHANGE_15M", "-1.0"))
     SHORT_MIN_RSI = float(os.getenv("SHORT_MIN_RSI", "65"))
     SHORT_MAX_RSI = float(os.getenv("SHORT_MAX_RSI", "85"))
     
@@ -344,7 +347,9 @@ def get_ticker(inst_id: str) -> Optional[dict]:
 
 
 @retry_on_failure()
-def get_klines(inst_id: str, bar: str = "15m", limit: int = None) -> Optional[pd.DataFrame]:
+def get_klines(inst_id: str, bar: str = None, limit: int = None) -> Optional[pd.DataFrame]:
+    if bar is None:
+        bar = Config.KLINE_BAR
     if limit is None:
         limit = Config.KLINE_LIMIT
     
@@ -810,13 +815,13 @@ def is_quality_long_signal(details: Dict, narrative_multiplier: float) -> Tuple[
     if change_15m < Config.LONG_MIN_CHANGE_15M:
         return False, f"涨幅不足({change_15m}%)", final_score
     
-    if final_score >= 6 and vol_ratio >= 1.2:
+    if final_score >= 7 and vol_ratio >= 1.5:
+        return True, f"🔥🔥强力做多({final_score}/9)+放量{vol_ratio}x", final_score
+    if final_score >= 6 and vol_ratio >= 1.5:
         return True, f"高分做多信号({final_score}/9)+放量{vol_ratio}x", final_score
-    if final_score >= 5 and vol_ratio >= 1.5 and change_15m >= 1.0:
-        return True, f"放量上涨({vol_ratio}x,+{change_15m}%)", final_score
-    if final_score >= 4 and vol_ratio >= 2.0 and change_15m >= 1.2:
+    if final_score >= 5 and vol_ratio >= 2.0 and change_15m >= 1.5:
         return True, f"爆量突破({vol_ratio}x,+{change_15m}%)", final_score
-    if vol_ratio >= 2.5 and change_15m >= 0.8 and details["trend_ok"]:
+    if vol_ratio >= 3.0 and change_15m >= 1.0 and details["trend_ok"]:
         return True, f"爆量启动({vol_ratio}x,+{change_15m}%)", final_score
     
     return False, f"条件不足(得分{final_score}/9,放量{vol_ratio}x,涨幅{change_15m}%)", final_score
@@ -840,13 +845,13 @@ def is_quality_short_signal(details: Dict, narrative_multiplier: float) -> Tuple
     if change_15m > Config.SHORT_MAX_CHANGE_15M:
         return False, f"跌幅不足({change_15m}%)", final_score
     
-    if final_score >= 6 and vol_ratio >= 1.2:
+    if final_score >= 7 and vol_ratio >= 1.5:
+        return True, f"🔥🔥强力做空({final_score}/9)+放量{vol_ratio}x", final_score
+    if final_score >= 6 and vol_ratio >= 1.5:
         return True, f"高分做空信号({final_score}/9)+放量{vol_ratio}x", final_score
-    if final_score >= 4 and vol_ratio >= 1.5 and change_15m <= -1.0:
-        return True, f"放量下跌({vol_ratio}x,{change_15m}%)", final_score
-    if final_score >= 4 and details["break_ok"] and vol_ratio >= 1.5:
-        return True, f"跌破支撑+放量{vol_ratio}x", final_score
-    if vol_ratio >= 2.5 and change_15m <= -1.0 and details["trend_ok"]:
+    if final_score >= 5 and vol_ratio >= 2.0 and change_15m <= -1.5:
+        return True, f"爆量下跌({vol_ratio}x,{change_15m}%)", final_score
+    if vol_ratio >= 3.0 and change_15m <= -1.0 and details["trend_ok"]:
         return True, f"爆量下跌({vol_ratio}x,{change_15m}%)", final_score
     
     return False, f"条件不足(得分{final_score}/9,放量{vol_ratio}x,跌幅{change_15m}%)", final_score
@@ -890,7 +895,8 @@ def analyze_long_symbol(inst_id: str, change_24h: float, narratives: Dict[str, f
     if not signal_cache.should_send(inst_id, 999, 0):
         return None
     
-    df = get_klines(inst_id)
+    # 使用配置的K线周期
+    df = get_klines(inst_id, bar=Config.KLINE_BAR)
     if df is None:
         return None
     
@@ -923,7 +929,7 @@ def analyze_short_symbol(inst_id: str, change_24h: float, narratives: Dict[str, 
     if not signal_cache.should_send(inst_id, 999, 0):
         return None
     
-    df = get_klines(inst_id)
+    df = get_klines(inst_id, bar=Config.KLINE_BAR)
     if df is None:
         return None
     
@@ -963,11 +969,9 @@ def parse_deepseek_analysis(analysis_text: str) -> Tuple[str, str]:
     if not analysis_text:
         return "", None
     
-    # 多种匹配模式
     patterns = [
         r'暴涨可能性[：:]\s*([高中低])',
         r'可能性[：:]\s*([高中低])',
-        r'[，,]\s*([高中低])[暴]?[涨]?',
     ]
     
     possibility = None
@@ -978,12 +982,10 @@ def parse_deepseek_analysis(analysis_text: str) -> Tuple[str, str]:
             break
     
     if possibility and possibility in ['高', '中', '低']:
-        # 移除可能性部分，只保留分析内容
         clean_text = re.sub(r'[。，,]\s*暴涨可能性[：:]\s*[高中低]', '', analysis_text)
         clean_text = re.sub(r'暴涨可能性[：:]\s*[高中低]', '', clean_text)
         clean_text = re.sub(r'可能性[：:]\s*[高中低]', '', clean_text)
         clean_text = clean_text.strip()
-        # 去除末尾多余的标点
         clean_text = re.sub(r'[。，,]+$', '', clean_text)
         if not clean_text:
             clean_text = analysis_text[:50]
@@ -995,7 +997,7 @@ def parse_deepseek_analysis(analysis_text: str) -> Tuple[str, str]:
 def deepseek_analyze_signal(signal: Dict) -> Tuple[str, str]:
     """
     调用 DeepSeek API 分析单个信号
-    返回: (分析文本, 暴涨可能性)  可能性为 '高'/'中'/'低' 或 None
+    返回: (分析文本, 暴涨可能性)
     """
     if not Config.ENABLE_DEEPSEEK or not Config.DEEPSEEK_API_KEY:
         return "", None
@@ -1003,7 +1005,6 @@ def deepseek_analyze_signal(signal: Dict) -> Tuple[str, str]:
     d = signal["details"]
     direction = signal["direction"]
     
-    # 根据方向微调提示
     change_desc = "涨幅" if d['change_15m'] > 0 else "跌幅"
 
     prompt = f"""分析以下{direction}信号：
@@ -1017,15 +1018,14 @@ RSI: {d['rsi']}
 最终分: {signal['final_score']}/9
 理由: {signal['quality_reason']}
 
-【必须严格按以下格式输出，不要遗漏任何部分】
+【必须严格按以下格式输出】
 一句话分析（20字内）。暴涨可能性：高/中/低
 
-示例输出：
+示例：
 "放量+技术分高，短期强势。暴涨可能性：高"
 "量能一般且RSI偏高，空间有限。暴涨可能性：中"
-"缩量上涨，动能不足。暴涨可能性：低"
 
-请现在输出："""
+请输出："""
 
     headers = {
         "Authorization": f"Bearer {Config.DEEPSEEK_API_KEY}",
@@ -1034,7 +1034,7 @@ RSI: {d['rsi']}
     payload = {
         "model": Config.DEEPSEEK_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,  # 低温度确保格式稳定
+        "temperature": 0.2,
         "max_tokens": 100
     }
 
@@ -1053,9 +1053,8 @@ RSI: {d['rsi']}
         
         clean_text, possibility = parse_deepseek_analysis(analysis)
         
-        # 降级逻辑：如果解析失败，使用得分判断
+        # 降级逻辑
         if not possibility:
-            logger.warning(f"解析失败，使用得分降级判断: {analysis}")
             if signal['final_score'] >= 7:
                 possibility = "高"
                 if not clean_text:
@@ -1073,7 +1072,6 @@ RSI: {d['rsi']}
         return clean_text, possibility
     except Exception as e:
         logger.warning(f"DeepSeek 分析失败: {e}")
-        # API 失败时的降级
         if signal['final_score'] >= 7:
             return "技术信号强劲", "高"
         elif signal['final_score'] >= 5:
@@ -1083,7 +1081,7 @@ RSI: {d['rsi']}
 
 
 # ============================================================
-# 飞书推送（增强叙事显示 + DeepSeek）
+# 飞书推送
 # ============================================================
 def send_feishu(signals: List[Dict]) -> bool:
     if not Config.FEISHU_WEBHOOK or not signals:
@@ -1094,7 +1092,7 @@ def send_feishu(signals: List[Dict]) -> bool:
     long_signals = [s for s in signals if s["direction"] == "LONG"]
     short_signals = [s for s in signals if s["direction"] == "SHORT"]
     
-    content_lines = [f"🚀 **多空信号扫描** | {now}\n"]
+    content_lines = [f"🚀 **多空信号扫描** | {now} | K线周期: {Config.KLINE_BAR}\n"]
     content_lines.append(f"📊 做多: {len(long_signals)}个 | 做空: {len(short_signals)}个\n")
     content_lines.append("━━━━━━━━━━━━━━━━━━━━\n")
     
@@ -1107,7 +1105,7 @@ def send_feishu(signals: List[Dict]) -> bool:
             direction_text = "做多"
             if s["final_score"] >= 7:
                 advice = "🔥🔥 强力买入"
-            elif s["final_score"] >= 5:
+            elif s["final_score"] >= 6:
                 advice = "✅ 建议买入"
             else:
                 advice = "👀 关注"
@@ -1116,7 +1114,7 @@ def send_feishu(signals: List[Dict]) -> bool:
             direction_text = "做空"
             if s["final_score"] >= 7:
                 advice = "🔥🔥 强力做空"
-            elif s["final_score"] >= 5:
+            elif s["final_score"] >= 6:
                 advice = "✅ 建议做空"
             else:
                 advice = "👀 关注做空"
@@ -1132,13 +1130,12 @@ def send_feishu(signals: List[Dict]) -> bool:
         msg += f"━━━━━━━━━━━━━━━━━━━━\n"
         msg += f"💰 **入场价格:** {d['price']}\n"
         change_emoji = "📈" if d['change_15m'] > 0 else "📉"
-        msg += f"{change_emoji} **15m变化:** {d['change_15m']:+.2f}% | **24h涨幅:** {s['change_24h']}%\n"
+        msg += f"{change_emoji} **{Config.KLINE_BAR}变化:** {d['change_15m']:+.2f}% | **24h涨幅:** {s['change_24h']}%\n"
         msg += f"⭐ **最终得分:** {s['final_score']}/9 | 技术分: {s['base_score']}/9 | 叙事乘数: {s['narrative_multiplier']:.2f}x\n"
         if s["matched_narratives"]:
             msg += f"🎭 **匹配叙事:** {', '.join(s['matched_narratives'])}\n"
         msg += f"📝 **信号理由:** {s['quality_reason']}\n\n"
         
-        # DeepSeek 分析结果（如果存在）
         if s.get("deepseek_analysis"):
             msg += f"{s['deepseek_analysis']}\n"
         
@@ -1180,7 +1177,7 @@ def send_feishu(signals: List[Dict]) -> bool:
         "content": {
             "post": {
                 "zh_cn": {
-                    "title": f"🚀 多空信号 | 做多{len(long_signals)} 做空{len(short_signals)}",
+                    "title": f"🚀 多空信号 | 做多{len(long_signals)} 做空{len(short_signals)} | {Config.KLINE_BAR}",
                     "content": [[{"tag": "text", "text": "\n".join(content_lines)}]]
                 }
             }
@@ -1332,12 +1329,12 @@ def send_market_report():
 
 
 # ============================================================
-# 扫描主函数（集成叙事 + DeepSeek + 过滤低可能性）
+# 扫描主函数
 # ============================================================
 def scan() -> None:
     logger.info("=" * 50)
     direction_text = "做多" + ("+做空" if Config.ENABLE_SHORT else "")
-    logger.info(f"开始新一轮扫描 - {direction_text}")
+    logger.info(f"开始新一轮扫描 - {direction_text} | K线周期: {Config.KLINE_BAR}")
     start_time = time.time()
     
     narratives = get_top_narratives() if Config.NARRATIVE_ENABLED else {}
@@ -1368,9 +1365,9 @@ def scan() -> None:
                         change_24h = round(change_raw, 2)
                 except:
                     change_24h = 0
-                filtered.append({"inst_id": inst_id, "change_24h": change_24h})
+                filtered.append({"inst_id": inst_id, "change_24h": change_24h, "vol_usd": vol_usd})
         
-        logger.info(f"成交额过滤后: {len(filtered)} 个")
+        logger.info(f"成交额过滤后: {len(filtered)} 个 (阈值: ${Config.MIN_VOLUME_USD/1000000:.0f}M)")
         
         if not filtered:
             logger.info("无符合条件的币种")
@@ -1389,6 +1386,10 @@ def scan() -> None:
             for future in as_completed(futures):
                 result = future.result()
                 if result:
+                    for item in filtered:
+                        if item["inst_id"] == result["inst_id"]:
+                            result["vol_usd"] = item["vol_usd"]
+                            break
                     triggers.append(result)
                     signal_cache.update(
                         result["inst_id"], 
@@ -1400,7 +1401,7 @@ def scan() -> None:
                     logger.info(
                         f"{direction_emoji} {result['inst_id']} | {result['direction']} | {result['quality_reason']} | "
                         f"最终分{result['final_score']}/9 | 技术分{d['base_score']}/9 | 叙事乘数{result['narrative_multiplier']:.2f}x | "
-                        f"放量{d['vol_ratio']}x | 15m:{d['change_15m']:+.2f}% | RSI{d['rsi']}"
+                        f"放量{d['vol_ratio']}x | {Config.KLINE_BAR}:{d['change_15m']:+.2f}% | RSI{d['rsi']} | 成交额:${result['vol_usd']/1000000:.1f}M"
                     )
                     
                     signal_id = db.save_signal({
@@ -1437,9 +1438,27 @@ def scan() -> None:
         elapsed = time.time() - start_time
         long_count = len([t for t in triggers if t["direction"] == "LONG"])
         short_count = len([t for t in triggers if t["direction"] == "SHORT"])
-        logger.info(f"扫描完成，耗时 {elapsed:.1f} 秒 | 做多:{long_count}个 做空:{short_count}个")
+        logger.info(f"扫描完成(技术分析)，耗时 {elapsed:.1f} 秒 | 做多:{long_count}个 做空:{short_count}个")
         
         if triggers:
+            # 金额过滤：成交额 ≥ 500万 USDT
+            MIN_VOLUME_FOR_PUSH = 5000000
+            filtered_by_volume = []
+            for signal in triggers:
+                vol_usd = signal.get("vol_usd", 0)
+                if vol_usd >= MIN_VOLUME_FOR_PUSH:
+                    filtered_by_volume.append(signal)
+                    logger.info(f"✅ {signal['inst_id']} 成交额: ${vol_usd/1000000:.1f}M，符合推送条件")
+                else:
+                    logger.info(f"⏭️ 跳过 {signal['inst_id']} - 成交额不足500万U (${vol_usd/1000000:.1f}M)")
+            
+            triggers = filtered_by_volume
+            
+            if not triggers:
+                logger.info("所有信号均被金额过滤（成交额<500万U），无推送")
+                return
+            
+            # DeepSeek 分析
             if Config.ENABLE_DEEPSEEK:
                 logger.info("正在调用 DeepSeek 分析信号...")
                 filtered_triggers = []
@@ -1449,12 +1468,10 @@ def scan() -> None:
                         signal = deepseek_futures[future]
                         analysis, possibility = future.result()
                         
-                        # 如果可能性为"低"，则跳过此信号
                         if possibility == "低":
                             logger.info(f"⏭️ 跳过 {signal['inst_id']} ({signal['direction']}) - DeepSeek 判定暴涨可能性低")
                             continue
                         
-                        # 保留信号，附加分析内容
                         if analysis:
                             signal["deepseek_analysis"] = f"\n🤖 **DeepSeek分析:** {analysis}。暴涨可能性：{possibility}"
                         else:
@@ -1489,8 +1506,9 @@ def health_check():
                     msg = f"✅ 多空扫描器已启动\n"
                     msg += f"📊 市场: {market['activity']}\n"
                     msg += f"💰 BTC: ${market['btc_volume']:.0f}M | {market['btc_change']:+.2f}%\n"
-                    msg += f"🎯 做多阈值: 最终得分≥{Config.LONG_SCORE_THRESHOLD} | 放量≥{Config.LONG_MIN_VOLUME_RATIO}x\n"
-                    msg += f"🎯 做空阈值: 最终得分≥{Config.SHORT_SCORE_THRESHOLD} | 放量≥{Config.SHORT_MIN_VOLUME_RATIO}x"
+                    msg += f"📈 K线周期: {Config.KLINE_BAR}\n"
+                    msg += f"🎯 做多阈值: 最终得分≥{Config.LONG_SCORE_THRESHOLD} | 放量≥{Config.LONG_MIN_VOLUME_RATIO}x | 涨幅≥{Config.LONG_MIN_CHANGE_15M}%\n"
+                    msg += f"🎯 做空阈值: 最终得分≥{Config.SHORT_SCORE_THRESHOLD} | 放量≥{Config.SHORT_MIN_VOLUME_RATIO}x | 跌幅≤{Config.SHORT_MIN_CHANGE_15M}%"
                     if Config.NARRATIVE_ENABLED:
                         msg += f"\n🎭 叙事热度已启用 (CoinGecko Trending) | 权重系数: {Config.NARRATIVE_WEIGHT}x"
                     if Config.ENABLE_DEEPSEEK:
@@ -1511,17 +1529,14 @@ def main():
         os.makedirs(db_dir, exist_ok=True)
     
     logger.info("=" * 50)
-    logger.info("OKX 多空信号扫描器启动 v3.3 (叙事热度 + DeepSeek 过滤低暴涨可能性)")
+    logger.info("OKX 多空信号扫描器启动 v4.0 (30分钟K线 + 质量优化)")
+    logger.info(f"K线周期: {Config.KLINE_BAR} | 扫描间隔: {Config.SCAN_INTERVAL}分钟")
     logger.info(f"做多: 最终得分≥{Config.LONG_SCORE_THRESHOLD} | 放量≥{Config.LONG_MIN_VOLUME_RATIO}x | 涨幅≥{Config.LONG_MIN_CHANGE_15M}%")
     logger.info(f"做空: 最终得分≥{Config.SHORT_SCORE_THRESHOLD} | 放量≥{Config.SHORT_MIN_VOLUME_RATIO}x | 跌幅≤{Config.SHORT_MIN_CHANGE_15M}%")
     if Config.NARRATIVE_ENABLED:
-        logger.info(f"叙事热度: 已启用 | 权重系数: {Config.NARRATIVE_WEIGHT}x | 数据源: CoinGecko Trending API")
-    else:
-        logger.info("叙事热度: 已禁用")
+        logger.info(f"叙事热度: 已启用 | 权重系数: {Config.NARRATIVE_WEIGHT}x")
     if Config.ENABLE_DEEPSEEK:
-        logger.info(f"DeepSeek 分析: 已启用 | 模型: {Config.DEEPSEEK_MODEL} (自动过滤暴涨可能性低的信号)")
-    else:
-        logger.info("DeepSeek 分析: 已禁用")
+        logger.info(f"DeepSeek 分析: 已启用 (自动过滤暴涨可能性低的信号)")
     
     health_check()
     
