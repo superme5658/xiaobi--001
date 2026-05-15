@@ -31,7 +31,7 @@ class Config:
     # K线周期配置
     ENTRY_TIMEFRAME = os.getenv("ENTRY_TIMEFRAME", "15m")
     TREND_TIMEFRAME = os.getenv("TREND_TIMEFRAME", "4H")
-    INTERMEDIATE_TIMEFRAME = os.getenv("INTERMEDIATE_TIMEFRAME", "1H")  # 新增1小时
+    INTERMEDIATE_TIMEFRAME = os.getenv("INTERMEDIATE_TIMEFRAME", "1H")
     
     # 通用筛选参数
     MIN_VOLUME_USD = int(os.getenv("MIN_VOLUME_USD", "2000000"))
@@ -78,6 +78,9 @@ class Config:
     
     # 资金费率过滤阈值（绝对值超过此值则过滤）
     FUNDING_RATE_THRESHOLD = float(os.getenv("FUNDING_RATE_THRESHOLD", "0.005"))  # 0.5%
+    
+    # 反转风险阈值（风险分≥此值则直接过滤）
+    REVERSAL_RISK_THRESHOLD = int(os.getenv("REVERSAL_RISK_THRESHOLD", "50"))
     
     # 推送冷却
     SIGNAL_COOLDOWN = 60 * 60
@@ -189,6 +192,7 @@ class Database:
                     take_profit_3 REAL,
                     timeframe TEXT,
                     funding_rate REAL,
+                    risk_score INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -234,8 +238,8 @@ class Database:
                         inst_id, direction, signal_time, price, score, narrative_multiplier,
                         volume_ratio, change_15m, change_24h, rsi, bb_position,
                         kdj_k, kdj_d, kdj_j, quality_reason,
-                        stop_loss, take_profit_1, take_profit_2, take_profit_3, timeframe, funding_rate
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        stop_loss, take_profit_1, take_profit_2, take_profit_3, timeframe, funding_rate, risk_score
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     signal_data['inst_id'],
                     signal_data['direction'],
@@ -257,7 +261,8 @@ class Database:
                     signal_data.get('take_profit_2'),
                     signal_data.get('take_profit_3'),
                     signal_data.get('timeframe', ''),
-                    signal_data.get('funding_rate')
+                    signal_data.get('funding_rate'),
+                    signal_data.get('risk_score')
                 ))
                 signal_id = cursor.lastrowid
                 conn.commit()
@@ -391,7 +396,6 @@ def get_current_price(inst_id: str) -> Optional[float]:
 
 @retry_on_failure()
 def get_funding_rate(inst_id: str) -> Optional[float]:
-    """获取永续合约的资金费率，仅对SWAP有效"""
     if not inst_id.endswith("-SWAP"):
         return None
     data = _okx_request(f"{Config.OKX_BASE_URL}/api/v5/public/funding-rate",
@@ -820,12 +824,6 @@ def check_4h_trend_short(df_4h: pd.DataFrame) -> Tuple[bool, str]:
 # 1小时趋势强度（加权分数：-1, 0, +1）
 # ============================================================
 def get_1h_trend_strength(df_1h: pd.DataFrame) -> int:
-    """
-    返回1小时趋势强度：
-    1: 强多头（价格 > EMA20 > EMA50）
-    0: 震荡
-    -1: 强空头（价格 < EMA20 < EMA50）
-    """
     if df_1h is None or len(df_1h) < 50:
         return 0
     
@@ -848,6 +846,130 @@ def get_1h_trend_strength(df_1h: pd.DataFrame) -> int:
         return -1
     else:
         return 0
+
+
+# ============================================================
+# 反转风险检测模块
+# ============================================================
+def detect_reversal_risk_long(df_entry: pd.DataFrame, df_trend: pd.DataFrame) -> Tuple[bool, int, str]:
+    """
+    检测做多信号的反转风险
+    返回: (是否高风险, 风险评分 0-100, 原因)
+    """
+    risk_score = 0
+    reasons = []
+    
+    close = df_entry["c"].iloc[-1]
+    ema20 = calc_ema(df_entry["c"], 20).iloc[-1]
+    if not pd.isna(ema20):
+        deviation = (close - ema20) / ema20 * 100
+        if deviation > 8:
+            risk_score += 30
+            reasons.append(f"价格偏离EMA20达{deviation:.1f}%")
+        elif deviation > 5:
+            risk_score += 15
+            reasons.append(f"价格偏离EMA20 {deviation:.1f}%")
+    
+    # 4小时上影线检测
+    if df_trend is not None and len(df_trend) > 0:
+        last_4h = df_trend.iloc[-1]
+        body = abs(last_4h['c'] - last_4h['o'])
+        upper_shadow = last_4h['h'] - max(last_4h['c'], last_4h['o'])
+        if body > 0 and upper_shadow > body * 1.5:
+            risk_score += 25
+            reasons.append("4H出现长上影线")
+    
+    # RSI顶背离（简化版）
+    if len(df_entry) > 30:
+        closes = df_entry['c']
+        rsi_vals = calc_rsi(closes, 14)
+        if len(rsi_vals) > 20:
+            recent_high_idx = closes.iloc[-20:].idxmax()
+            if recent_high_idx in rsi_vals.index:
+                recent_rsi = rsi_vals[recent_high_idx]
+                if not pd.isna(recent_rsi) and not pd.isna(rsi_vals.iloc[-1]):
+                    if closes.iloc[-1] > closes[recent_high_idx] and rsi_vals.iloc[-1] < recent_rsi:
+                        risk_score += 35
+                        reasons.append("RSI顶背离")
+    
+    # 上涨缩量
+    vol = df_entry['vol']
+    if len(vol) > 10:
+        recent_vol_avg = vol.iloc[-5:].mean()
+        prev_vol_avg = vol.iloc[-10:-5].mean()
+        if prev_vol_avg > 0 and recent_vol_avg < prev_vol_avg * 0.7:
+            risk_score += 20
+            reasons.append("上涨缩量")
+    
+    # 布林带上轨外
+    upper, middle, lower = calc_bollinger_bands(df_entry['c'], 20, 2)
+    if not pd.isna(upper.iloc[-1]) and close > upper.iloc[-1] * 1.01:
+        risk_score += 30
+        reasons.append("价格超出布林上轨")
+    
+    is_high_risk = risk_score >= Config.REVERSAL_RISK_THRESHOLD
+    reason_str = " | ".join(reasons) if reasons else "无明显反转信号"
+    return is_high_risk, min(risk_score, 100), reason_str
+
+
+def detect_reversal_risk_short(df_entry: pd.DataFrame, df_trend: pd.DataFrame) -> Tuple[bool, int, str]:
+    """
+    检测做空信号的反转风险
+    """
+    risk_score = 0
+    reasons = []
+    
+    close = df_entry["c"].iloc[-1]
+    ema20 = calc_ema(df_entry["c"], 20).iloc[-1]
+    if not pd.isna(ema20):
+        deviation = (ema20 - close) / ema20 * 100
+        if deviation > 8:
+            risk_score += 30
+            reasons.append(f"价格低于EMA20达{deviation:.1f}%")
+        elif deviation > 5:
+            risk_score += 15
+            reasons.append(f"价格低于EMA20 {deviation:.1f}%")
+    
+    # 4小时下影线
+    if df_trend is not None and len(df_trend) > 0:
+        last_4h = df_trend.iloc[-1]
+        body = abs(last_4h['c'] - last_4h['o'])
+        lower_shadow = min(last_4h['c'], last_4h['o']) - last_4h['l']
+        if body > 0 and lower_shadow > body * 1.5:
+            risk_score += 25
+            reasons.append("4H出现长下影线")
+    
+    # RSI底背离
+    if len(df_entry) > 30:
+        closes = df_entry['c']
+        rsi_vals = calc_rsi(closes, 14)
+        if len(rsi_vals) > 20:
+            recent_low_idx = closes.iloc[-20:].idxmin()
+            if recent_low_idx in rsi_vals.index:
+                recent_rsi = rsi_vals[recent_low_idx]
+                if not pd.isna(recent_rsi) and not pd.isna(rsi_vals.iloc[-1]):
+                    if closes.iloc[-1] < closes[recent_low_idx] and rsi_vals.iloc[-1] > recent_rsi:
+                        risk_score += 35
+                        reasons.append("RSI底背离")
+    
+    # 下跌缩量
+    vol = df_entry['vol']
+    if len(vol) > 10:
+        recent_vol_avg = vol.iloc[-5:].mean()
+        prev_vol_avg = vol.iloc[-10:-5].mean()
+        if prev_vol_avg > 0 and recent_vol_avg < prev_vol_avg * 0.7:
+            risk_score += 20
+            reasons.append("下跌缩量")
+    
+    # 布林带下轨外
+    upper, middle, lower = calc_bollinger_bands(df_entry['c'], 20, 2)
+    if not pd.isna(lower.iloc[-1]) and close < lower.iloc[-1] * 0.99:
+        risk_score += 30
+        reasons.append("价格跌破布林下轨")
+    
+    is_high_risk = risk_score >= Config.REVERSAL_RISK_THRESHOLD
+    reason_str = " | ".join(reasons) if reasons else "无明显反转信号"
+    return is_high_risk, min(risk_score, 100), reason_str
 
 
 # ============================================================
@@ -1028,14 +1150,13 @@ signal_cache = SignalCache()
 
 
 # ============================================================
-# 双周期 + 1小时加权 + 资金费率过滤
+# 完整分析函数（含资金费率、1H加权、反转风险检测）
 # ============================================================
 def analyze_long_with_confirmation(inst_id: str, change_24h: float, narratives: Dict[str, float]) -> Optional[Dict]:
-    """做多：15分钟入场 + 4H趋势确认 + 1H加权 + 资金费率过滤"""
     if not signal_cache.should_send(inst_id, 999, 0):
         return None
     
-    # 资金费率过滤（仅对合约）
+    # 资金费率过滤
     funding_rate = None
     if inst_id.endswith("-SWAP"):
         funding_rate = get_funding_rate(inst_id)
@@ -1043,55 +1164,62 @@ def analyze_long_with_confirmation(inst_id: str, change_24h: float, narratives: 
             logger.info(f"⏭️ 跳过 {inst_id} 做多 - 资金费率过高 ({funding_rate*100:.2f}%)")
             return None
     
-    # 获取15分钟K线（入场信号）
+    # 获取K线
     df_entry = get_klines(inst_id, bar=Config.ENTRY_TIMEFRAME)
     if df_entry is None:
         return None
-    
-    # 获取4小时K线（趋势确认）
     df_trend = get_klines(inst_id, bar=Config.TREND_TIMEFRAME)
     if df_trend is None:
         return None
-    
-    # 获取1小时K线（加权）
     df_intermediate = get_klines(inst_id, bar=Config.INTERMEDIATE_TIMEFRAME)
     if df_intermediate is None:
         return None
     
-    # 分析15分钟信号
+    # 技术分析
     tech_details = analyze_long(df_entry)
     base_score = tech_details["base_score"]
     
-    # 检查4小时趋势
+    # 4H趋势确认
     trend_ok, trend_reason = check_4h_trend_long(df_trend)
     if not trend_ok:
         logger.debug(f"{inst_id} 4小时趋势不符合做多: {trend_reason}")
         return None
     
-    # 1小时趋势强度
+    # 1H趋势强度
     strength_1h = get_1h_trend_strength(df_intermediate)
+    
+    # 反转风险检测
+    is_high_risk, risk_score, risk_reason = detect_reversal_risk_long(df_entry, df_trend)
+    if is_high_risk:
+        logger.info(f"⏭️ 跳过 {inst_id} 做多 - 反转风险高: {risk_reason} (风险分{risk_score})")
+        return None
     
     # 叙事乘数
     narrative_multiplier, matched_narratives = get_narrative_multiplier(inst_id, narratives)
     final_score = int(round(base_score * narrative_multiplier))
     
-    # 1小时加权：强多头+1分，震荡不加分，强空头不加分（做多时）
-    weighted_score = final_score + (1 if strength_1h == 1 else 0)
+    # 1H加权 + 风险扣分（每20风险分扣1分）
+    risk_penalty = int(risk_score / 20)
+    weighted_score = final_score + (1 if strength_1h == 1 else 0) - risk_penalty
     
+    # 质量检查
     is_quality, reason, _ = is_quality_long_signal(tech_details, narrative_multiplier)
     
     if is_quality and weighted_score >= Config.LONG_SCORE_THRESHOLD:
         tp_sl = calculate_long_tp_sl(tech_details["price"], tech_details["vol_ratio"], weighted_score)
-        # 构建质量理由字符串
         extra_info = []
         if strength_1h == 1:
-            extra_info.append("1H趋势多头")
+            extra_info.append("1H趋势多头+1")
+        if risk_score > 0:
+            extra_info.append(f"风险分{risk_score}(扣{risk_penalty})")
         if funding_rate is not None:
             extra_info.append(f"费率{funding_rate*100:.2f}%")
         extra_str = " | ".join(extra_info) if extra_info else ""
         quality_reason = f"{reason} | 4H趋势: {trend_reason} ✅"
         if extra_str:
             quality_reason += f" | {extra_str}"
+        if risk_reason != "无明显反转信号":
+            quality_reason += f" | 风险: {risk_reason}"
         
         return {
             "inst_id": inst_id,
@@ -1106,13 +1234,13 @@ def analyze_long_with_confirmation(inst_id: str, change_24h: float, narratives: 
             "tp_sl": tp_sl,
             "timeframe": f"{Config.ENTRY_TIMEFRAME}+{Config.TREND_TIMEFRAME}",
             "funding_rate": funding_rate,
-            "strength_1h": strength_1h,
+            "risk_score": risk_score,
+            "risk_warning": risk_reason if risk_score > 0 else None,
         }
     return None
 
 
 def analyze_short_with_confirmation(inst_id: str, change_24h: float, narratives: Dict[str, float]) -> Optional[Dict]:
-    """做空：15分钟入场 + 4H趋势确认 + 1H加权 + 资金费率过滤"""
     if not signal_cache.should_send(inst_id, 999, 0):
         return None
     
@@ -1126,11 +1254,9 @@ def analyze_short_with_confirmation(inst_id: str, change_24h: float, narratives:
     df_entry = get_klines(inst_id, bar=Config.ENTRY_TIMEFRAME)
     if df_entry is None:
         return None
-    
     df_trend = get_klines(inst_id, bar=Config.TREND_TIMEFRAME)
     if df_trend is None:
         return None
-    
     df_intermediate = get_klines(inst_id, bar=Config.INTERMEDIATE_TIMEFRAME)
     if df_intermediate is None:
         return None
@@ -1145,11 +1271,16 @@ def analyze_short_with_confirmation(inst_id: str, change_24h: float, narratives:
     
     strength_1h = get_1h_trend_strength(df_intermediate)
     
+    is_high_risk, risk_score, risk_reason = detect_reversal_risk_short(df_entry, df_trend)
+    if is_high_risk:
+        logger.info(f"⏭️ 跳过 {inst_id} 做空 - 反转风险高: {risk_reason} (风险分{risk_score})")
+        return None
+    
     narrative_multiplier, matched_narratives = get_narrative_multiplier(inst_id, narratives)
     final_score = int(round(base_score * narrative_multiplier))
     
-    # 做空时，1小时强空头（strength == -1）才加分
-    weighted_score = final_score + (1 if strength_1h == -1 else 0)
+    risk_penalty = int(risk_score / 20)
+    weighted_score = final_score + (1 if strength_1h == -1 else 0) - risk_penalty
     
     is_quality, reason, _ = is_quality_short_signal(tech_details, narrative_multiplier)
     
@@ -1157,13 +1288,17 @@ def analyze_short_with_confirmation(inst_id: str, change_24h: float, narratives:
         tp_sl = calculate_short_tp_sl(tech_details["price"], tech_details["vol_ratio"], weighted_score)
         extra_info = []
         if strength_1h == -1:
-            extra_info.append("1H趋势空头")
+            extra_info.append("1H趋势空头+1")
+        if risk_score > 0:
+            extra_info.append(f"风险分{risk_score}(扣{risk_penalty})")
         if funding_rate is not None:
             extra_info.append(f"费率{funding_rate*100:.2f}%")
         extra_str = " | ".join(extra_info) if extra_info else ""
         quality_reason = f"{reason} | 4H趋势: {trend_reason} ✅"
         if extra_str:
             quality_reason += f" | {extra_str}"
+        if risk_reason != "无明显反转信号":
+            quality_reason += f" | 风险: {risk_reason}"
         
         return {
             "inst_id": inst_id,
@@ -1178,7 +1313,8 @@ def analyze_short_with_confirmation(inst_id: str, change_24h: float, narratives:
             "tp_sl": tp_sl,
             "timeframe": f"{Config.ENTRY_TIMEFRAME}+{Config.TREND_TIMEFRAME}",
             "funding_rate": funding_rate,
-            "strength_1h": strength_1h,
+            "risk_score": risk_score,
+            "risk_warning": risk_reason if risk_score > 0 else None,
         }
     return None
 
@@ -1308,7 +1444,7 @@ def send_feishu(signals: List[Dict]) -> bool:
     short_signals = [s for s in signals if s["direction"] == "SHORT"]
     
     content_lines = [f"🚀 **多空信号扫描** | {now}\n"]
-    content_lines.append(f"📊 策略: {Config.ENTRY_TIMEFRAME}+{Config.TREND_TIMEFRAME}+1H加权\n")
+    content_lines.append(f"📊 策略: {Config.ENTRY_TIMEFRAME}+{Config.TREND_TIMEFRAME}+1H加权+反转检测\n")
     content_lines.append(f"📊 做多: {len(long_signals)}个 | 做空: {len(short_signals)}个\n")
     content_lines.append("━━━━━━━━━━━━━━━━━━━━\n")
     
@@ -1349,10 +1485,12 @@ def send_feishu(signals: List[Dict]) -> bool:
         msg += f"{change_emoji} **{Config.ENTRY_TIMEFRAME}变化:** {d['change']:+.2f}% | **24h涨幅:** {s['change_24h']}%\n"
         msg += f"⭐ **最终得分:** {s['final_score']}/9 | 技术分: {s['base_score']}/9 | 叙事乘数: {s['narrative_multiplier']:.2f}x\n"
         msg += f"📈 **4H趋势确认:** ✅ 符合做{'多' if s['direction'] == 'LONG' else '空'}方向\n"
+        if s.get("risk_score", 0) > 0:
+            msg += f"⚠️ **反转风险:** {s.get('risk_warning', '')} (风险分{s.get('risk_score', 0)})\n"
         if s.get("strength_1h") == 1 and s["direction"] == "LONG":
-            msg += f"📈 **1H趋势:** 多头排列 ✅ (+1分)\n"
+            msg += f"📈 **1H趋势:** 多头排列 (+1分)\n"
         elif s.get("strength_1h") == -1 and s["direction"] == "SHORT":
-            msg += f"📉 **1H趋势:** 空头排列 ✅ (+1分)\n"
+            msg += f"📉 **1H趋势:** 空头排列 (+1分)\n"
         if s.get("funding_rate") is not None:
             fr = s["funding_rate"] * 100
             msg += f"💰 **资金费率:** {fr:+.2f}% (正常范围)\n"
@@ -1401,7 +1539,7 @@ def send_feishu(signals: List[Dict]) -> bool:
         "content": {
             "post": {
                 "zh_cn": {
-                    "title": f"🚀 信号 | {Config.ENTRY_TIMEFRAME}+{Config.TREND_TIMEFRAME}+1H | 做多{len(long_signals)} 做空{len(short_signals)}",
+                    "title": f"🚀 信号 | {Config.ENTRY_TIMEFRAME}+{Config.TREND_TIMEFRAME}+风险检测 | 做多{len(long_signals)} 做空{len(short_signals)}",
                     "content": [[{"tag": "text", "text": "\n".join(content_lines)}]]
                 }
             }
@@ -1558,7 +1696,7 @@ def send_market_report():
 def scan() -> None:
     logger.info("=" * 50)
     direction_text = "做多" + ("+做空" if Config.ENABLE_SHORT else "")
-    logger.info(f"开始新一轮扫描 - 策略: {Config.ENTRY_TIMEFRAME}(入场) + {Config.TREND_TIMEFRAME}(趋势) + 1H加权 + 资金费率过滤")
+    logger.info(f"开始新一轮扫描 - 策略: {Config.ENTRY_TIMEFRAME}(入场) + {Config.TREND_TIMEFRAME}(趋势) + 1H加权 + 反转风险检测")
     start_time = time.time()
     
     narratives = get_top_narratives() if Config.NARRATIVE_ENABLED else {}
@@ -1649,7 +1787,8 @@ def scan() -> None:
                         'take_profit_2': result["tp_sl"]['take_profit_2'],
                         'take_profit_3': result["tp_sl"]['take_profit_3'],
                         'timeframe': result.get("timeframe", ""),
-                        'funding_rate': result.get("funding_rate")
+                        'funding_rate': result.get("funding_rate"),
+                        'risk_score': result.get("risk_score")
                     })
                     
                     if signal_id:
@@ -1729,11 +1868,12 @@ def health_check():
             if Config.FEISHU_WEBHOOK:
                 market = get_market_health()
                 if market:
-                    msg = f"✅ 多空扫描器已启动 (资金费率过滤 + 1H加权)\n"
+                    msg = f"✅ 多空扫描器已启动 (反转风险检测)\n"
                     msg += f"📊 市场: {market['activity']}\n"
                     msg += f"💰 BTC: ${market['btc_volume']:.0f}M | {market['btc_change']:+.2f}%\n"
-                    msg += f"📈 策略: {Config.ENTRY_TIMEFRAME}(入场) + {Config.TREND_TIMEFRAME}(趋势) + 1H加权\n"
+                    msg += f"📈 策略: {Config.ENTRY_TIMEFRAME}(入场) + {Config.TREND_TIMEFRAME}(趋势) + 1H加权 + 反转检测\n"
                     msg += f"🔒 资金费率阈值: ±{Config.FUNDING_RATE_THRESHOLD*100:.1f}%\n"
+                    msg += f"⚠️ 反转风险阈值: {Config.REVERSAL_RISK_THRESHOLD}分\n"
                     msg += f"🎯 做多阈值: 最终得分≥{Config.LONG_SCORE_THRESHOLD} | 放量≥{Config.LONG_MIN_VOLUME_RATIO}x | 涨幅≥{Config.LONG_MIN_CHANGE_15M}%\n"
                     msg += f"🎯 做空阈值: 最终得分≥{Config.SHORT_SCORE_THRESHOLD} | 放量≥{Config.SHORT_MIN_VOLUME_RATIO}x | 跌幅≤{Config.SHORT_MIN_CHANGE_15M}%"
                     if Config.NARRATIVE_ENABLED:
@@ -1756,10 +1896,11 @@ def main():
         os.makedirs(db_dir, exist_ok=True)
     
     logger.info("=" * 50)
-    logger.info("OKX 多空信号扫描器启动 v6.0 (资金费率过滤 + 1H加权)")
+    logger.info("OKX 多空信号扫描器启动 v7.0 (反转风险检测)")
     logger.info(f"入场周期: {Config.ENTRY_TIMEFRAME} | 趋势周期: {Config.TREND_TIMEFRAME} | 加权周期: {Config.INTERMEDIATE_TIMEFRAME}")
     logger.info(f"扫描间隔: {Config.SCAN_INTERVAL}分钟")
     logger.info(f"资金费率过滤阈值: ±{Config.FUNDING_RATE_THRESHOLD*100:.1f}%")
+    logger.info(f"反转风险过滤阈值: {Config.REVERSAL_RISK_THRESHOLD}分")
     logger.info(f"做多: 最终得分≥{Config.LONG_SCORE_THRESHOLD} | 放量≥{Config.LONG_MIN_VOLUME_RATIO}x | 涨幅≥{Config.LONG_MIN_CHANGE_15M}%")
     logger.info(f"做空: 最终得分≥{Config.SHORT_SCORE_THRESHOLD} | 放量≥{Config.SHORT_MIN_VOLUME_RATIO}x | 跌幅≤{Config.SHORT_MIN_CHANGE_15M}%")
     if Config.NARRATIVE_ENABLED:
